@@ -1,7 +1,9 @@
 import { defineStore } from 'pinia'
-import type { Cue, EditorDocument, Locale, Snapshot } from '../types'
-import { loadDocument, saveDocument } from '../utils/db'
+import { ElMessage } from 'element-plus'
+import type { Cue, CueMergeConflict, EditorDocument, Locale, Snapshot } from '../types'
+import { loadDocument, putDocument } from '../utils/db'
 import { makeId } from '../utils/id'
+import { mergeCues, migrateDocument, cuesChanged, withRevisions, cloneCue, mergeOneCue, cueEquals, DELETE_FIELD } from '../utils/merge'
 import { parseScript, parseSrt, toSrt } from '../utils/subtitle'
 import { translate, type MessageKey } from '../i18n'
 
@@ -58,6 +60,10 @@ export const useEditorStore = defineStore('subtitle-editor', {
     tabId: makeId('tab'),
     lastSeenRevision: 0,
     mutationSerial: 0,
+    /** Synced-state snapshot used as the three-way merge base for this tab. */
+    baseCues: [] as Cue[],
+    /** Per-cue conflicts waiting for the user to pick a side. */
+    cueConflicts: [] as CueMergeConflict[],
     past: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
     future: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
   }),
@@ -81,11 +87,14 @@ export const useEditorStore = defineStore('subtitle-editor', {
       this.online = navigator.onLine
       const stored = await loadDocument(DOCUMENT_ID)
       if (stored) {
-        this.document = stored
-        this.lastSeenRevision = stored.revision
+        const migrated = migrateDocument(stored)
+        this.document = migrated
+        this.baseCues = cloneCues(migrated.cues)
+        this.lastSeenRevision = migrated.revision
       } else {
-        const saved = await saveDocument(plainDocument(this.document))
+        const saved = await putDocument({ ...migrateDocument(plainDocument(this.document)), lastWriter: this.tabId })
         this.document = saved
+        this.baseCues = cloneCues(saved.cues)
         this.lastSeenRevision = saved.revision
       }
       this.initialized = true
@@ -95,15 +104,17 @@ export const useEditorStore = defineStore('subtitle-editor', {
           const message = event.data as { type: string; tabId: string; revision: number; documentId: string }
           if (message.type !== 'document-updated' || message.tabId === this.tabId || message.documentId !== DOCUMENT_ID) return
           if (message.revision <= this.lastSeenRevision) return
-          if (this.saveState === 'dirty' || this.saveState === 'saving' || this.conflict) {
-            this.conflict = true
-            this.saveState = 'conflict'
-            return
-          }
+          this.lastSeenRevision = message.revision
+          // With unsaved work we keep editing locally; the next save merges cue by cue.
+          if (this.saveState === 'dirty' || this.saveState === 'saving' || this.conflict) return
           const latest = await loadDocument(DOCUMENT_ID)
           if (latest && latest.revision > this.lastSeenRevision) {
-            this.document = latest
-            this.lastSeenRevision = latest.revision
+            const migrated = migrateDocument(latest)
+            this.document = migrated
+            this.baseCues = cloneCues(migrated.cues)
+            this.lastSeenRevision = migrated.revision
+            this.cueConflicts = []
+            this.conflict = false
             this.saveState = 'saved'
           }
         }
@@ -140,29 +151,66 @@ export const useEditorStore = defineStore('subtitle-editor', {
       }
     },
     async persist(label = 'autosave') {
-      if (!this.initialized || this.conflict || this.saveState === 'saving') return
+      if (!this.initialized || this.saving) return
       const serial = this.mutationSerial
-      this.saveState = 'saving'
       this.saving = true
+      this.saveState = 'saving'
       try {
-        const next = await saveDocument({ ...plainDocument(this.document), lastWriter: this.tabId }, this.lastSeenRevision)
-        this.document.revision = next.revision
-        this.document.updatedAt = next.updatedAt
-        this.lastSeenRevision = next.revision
-        if (serial === this.mutationSerial) {
-          this.saveState = 'saved'
-        } else {
-          this.saveState = 'dirty'
+        const stored = await loadDocument(DOCUMENT_ID)
+        const remoteDoc = stored ? migrateDocument(stored) : migrateDocument(plainDocument(this.document))
+        const base = this.baseCues.length ? cloneCues(this.baseCues) : cloneCues(remoteDoc.cues)
+        // Display values (may hold an unresolved local pick) vs. the merge input.
+        const localMap = new Map(this.document.cues.map((cue) => [cue.id, cue]))
+        const local = cloneCues(this.document.cues)
+        const known = new Set(this.cueConflicts.map((item) => item.cueId))
+        // Unresolved conflicts are written only via resolveCue; keep them out of the merge
+        // so a later save cannot silently overwrite the other side.
+        for (const conflictId of known) {
+          const synced = base.find((cue) => cue.id === conflictId)
+          const index = local.findIndex((cue) => cue.id === conflictId)
+          if (synced && index >= 0) local[index] = cloneCue(synced)
         }
-        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_ID })
+        const result = mergeCues(base, local, remoteDoc.cues)
+
+        // Cues already in conflict are not re-reported; the server keeps the remote version.
+        const freshConflicts = result.conflicts.filter((item) => !known.has(item.cueId))
+        const allConflicts = [...this.cueConflicts, ...freshConflicts]
+        const conflictIds = new Set(allConflicts.map((item) => item.cueId))
+
+        const syncDisplay = (doc: EditorDocument) => {
+          this.document.cues = doc.cues.map((cue) => (conflictIds.has(cue.id) ? (localMap.get(cue.id) ?? cue) : cue))
+          this.document.revision = doc.revision
+          this.document.updatedAt = doc.updatedAt
+        }
+
+        if (!cuesChanged(result.cues, remoteDoc.cues)) {
+          // Nothing mergeable to write; stay in sync with what is stored.
+          syncDisplay(remoteDoc)
+          this.baseCues = cloneCues(remoteDoc.cues)
+          this.cueConflicts = allConflicts
+          this.conflict = allConflicts.length > 0
+          this.saveState = this.conflict ? 'conflict' : serial === this.mutationSerial ? 'saved' : 'dirty'
+          return
+        }
+
+        const nextDoc: EditorDocument = {
+          ...plainDocument(this.document),
+          cues: withRevisions(result.cues, remoteDoc.cues),
+          revision: remoteDoc.revision + 1,
+          updatedAt: Date.now(),
+          lastWriter: this.tabId,
+        }
+        const saved = await putDocument(nextDoc)
+        syncDisplay(saved)
+        this.baseCues = cloneCues(saved.cues)
+        this.lastSeenRevision = saved.revision
+        this.cueConflicts = allConflicts
+        this.conflict = allConflicts.length > 0
+        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: saved.revision, documentId: DOCUMENT_ID })
+        this.saveState = this.conflict ? 'conflict' : serial === this.mutationSerial ? 'saved' : 'dirty'
       } catch (error) {
-        if (error instanceof Error && error.message === 'REVISION_CONFLICT') {
-          this.conflict = true
-          this.saveState = 'conflict'
-        } else {
-          this.saveState = 'dirty'
-          console.error(label, error)
-        }
+        this.saveState = 'dirty'
+        console.error(label, error)
       } finally {
         this.saving = false
         if (this.saveState === 'dirty') {
@@ -171,29 +219,125 @@ export const useEditorStore = defineStore('subtitle-editor', {
         }
       }
     },
-    async keepMine() {
+    /** Resolve one conflicting cue: accept the stored version or retry saving this tab's version. */
+    async resolveCue(cueId: string, choice: 'mine' | 'theirs') {
+      const item = this.cueConflicts.find((conflict) => conflict.cueId === cueId)
+      if (!item) return
+      if (choice === 'theirs') {
+        const index = this.document.cues.findIndex((cue) => cue.id === cueId)
+        if (item.remote) {
+          if (index >= 0) this.document.cues.splice(index, 1, cloneCue(item.remote))
+          else this.document.cues.push(cloneCue(item.remote))
+        } else if (index >= 0) {
+          this.document.cues.splice(index, 1) // the other side deleted it
+        }
+        this.baseCues = cloneCues(this.document.cues)
+        this.cueConflicts = this.cueConflicts.filter((conflict) => conflict.cueId !== cueId)
+        this.conflict = this.cueConflicts.length > 0
+        this.saveState = this.conflict ? 'conflict' : 'saved'
+        return
+      }
+      await this.retryCue(cueId)
+    },
+    /** Retry saving a single conflicting cue; failure never rolls back already-saved cues. */
+    async retryCue(cueId: string): Promise<boolean> {
+      const item = this.cueConflicts.find((conflict) => conflict.cueId === cueId)
+      if (!item || this.saving) return false
+      this.saving = true
       try {
-        this.saving = true
-        const latest = await loadDocument(DOCUMENT_ID)
-        const expected = latest?.revision ?? this.lastSeenRevision
-        const next = await saveDocument({ ...plainDocument(this.document), lastWriter: this.tabId }, expected)
-        this.document.revision = next.revision
-        this.lastSeenRevision = next.revision
-        this.conflict = false
-        this.saveState = 'saved'
-        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_ID })
+        const stored = await loadDocument(DOCUMENT_ID)
+        const remoteDoc = stored ? migrateDocument(stored) : migrateDocument(plainDocument(this.document))
+        const remoteCue = remoteDoc.cues.find((cue) => cue.id === cueId)
+        const localCue = this.document.cues.find((cue) => cue.id === cueId)
+        const remoteUnchanged = item.remote ? cueEquals(remoteCue, item.remote) : remoteCue === undefined
+
+        let nextCues: Cue[]
+        if (item.fields.includes(DELETE_FIELD)) {
+          if (item.local && !item.remote) {
+            // This side modified, the other deleted → keep this side's cue.
+            if (remoteCue && !remoteUnchanged) {
+              const outcome = mergeOneCue(item.base, item.local, remoteCue)
+              if (outcome.kind !== 'keep') {
+                this.notifyRetryFailed()
+                return false
+              }
+              nextCues = remoteDoc.cues.map((cue) => (cue.id === cueId ? outcome.cue : cue))
+              if (!nextCues.some((cue) => cue.id === cueId)) nextCues.push(outcome.cue)
+            } else {
+              nextCues = remoteDoc.cues.filter((cue) => cue.id !== cueId).concat(cloneCue(item.local))
+            }
+          } else if (!item.local && item.remote) {
+            // This side deleted, the other modified → insist on deleting.
+            if (remoteCue && !remoteUnchanged) {
+              this.notifyRetryFailed()
+              return false
+            }
+            nextCues = remoteDoc.cues.filter((cue) => cue.id !== cueId)
+          } else {
+            this.notifyRetryFailed()
+            return false
+          }
+        } else {
+          if (remoteUnchanged) {
+            if (!localCue) {
+              this.notifyRetryFailed()
+              return false
+            }
+            nextCues = remoteDoc.cues.map((cue) => (cue.id === cueId ? cloneCue(localCue) : cue))
+          } else {
+            // The other side changed this cue again → re-merge; only stop if it still collides.
+            const outcome = mergeOneCue(item.base, localCue, remoteCue)
+            if (outcome.kind !== 'keep') {
+              this.notifyRetryFailed()
+              return false
+            }
+            nextCues = remoteDoc.cues.map((cue) => (cue.id === cueId ? outcome.cue : cue))
+            if (!nextCues.some((cue) => cue.id === cueId)) nextCues.push(outcome.cue)
+          }
+        }
+
+        const nextDoc: EditorDocument = {
+          ...plainDocument(this.document),
+          cues: withRevisions(nextCues, remoteDoc.cues),
+          revision: remoteDoc.revision + 1,
+          updatedAt: Date.now(),
+          lastWriter: this.tabId,
+        }
+        const saved = await putDocument(nextDoc)
+        this.document.cues = saved.cues
+        this.document.revision = saved.revision
+        this.document.updatedAt = saved.updatedAt
+        this.baseCues = cloneCues(saved.cues)
+        this.lastSeenRevision = saved.revision
+        this.cueConflicts = this.cueConflicts.filter((conflict) => conflict.cueId !== cueId)
+        this.conflict = this.cueConflicts.length > 0
+        this.saveState = this.conflict ? 'conflict' : 'saved'
+        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: saved.revision, documentId: DOCUMENT_ID })
+        return true
+      } catch (error) {
+        console.error('retryCue', error)
+        this.notifyRetryFailed()
+        return false
       } finally {
         this.saving = false
       }
     },
+    notifyRetryFailed() {
+      this.conflict = true
+      this.saveState = 'conflict'
+      ElMessage.error(translate(this.document.language, 'retryFailed'))
+    },
     async loadLatest() {
       const latest = await loadDocument(DOCUMENT_ID)
       if (!latest) return
-      this.document = latest
-      this.lastSeenRevision = latest.revision
+      const migrated = migrateDocument(latest)
+      this.document = migrated
+      this.baseCues = cloneCues(migrated.cues)
+      this.lastSeenRevision = migrated.revision
+      this.cueConflicts = []
       this.conflict = false
       this.saveState = 'saved'
-      this.selectedCueId = latest.cues[0]?.id ?? null
+      this.selectedCueId = migrated.cues[0]?.id ?? null
     },
     undo() {
       const entry = this.past.pop()

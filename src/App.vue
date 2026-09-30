@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -9,13 +9,22 @@ import {
 import { useEditorStore } from './store/editor'
 import type { Cue, CueConflict } from './types'
 import { formatTime } from './utils/subtitle'
+import { DELETE_FIELD } from './utils/merge'
 
 const store = useEditorStore()
-const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, online, timelineZoom, actorFilter } = storeToRefs(store)
+const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, cueConflicts, online, timelineZoom, actorFilter } = storeToRefs(store)
 const fileInput = ref<HTMLInputElement>()
 const snapshotDialog = ref(false)
+const conflictDialog = ref(false)
 const snapshotName = ref('')
 const search = ref('')
+
+watch(conflict, (value) => {
+  if (value) conflictDialog.value = true
+})
+watch(cueConflicts, (value) => {
+  if (!value.length) conflictDialog.value = false
+})
 
 const filteredCues = computed(() => {
   const query = search.value.trim().toLowerCase()
@@ -32,6 +41,31 @@ const actorColor = (id: string) => project.value.actors.find((actor) => actor.id
 const actorName = (id: string) => project.value.actors.find((actor) => actor.id === id)?.name ?? '—'
 const statusLabel = (status: Cue['status']) => store.t(status)
 const statusType = (status: Cue['status']) => status === 'reviewed' ? 'success' : status === 'issue' ? 'danger' : 'info'
+
+function cueDisplay(cue: Cue | undefined, cueId: string): string {
+  const index = project.value.cues.findIndex((item) => item.id === cueId)
+  const preview = (cue?.source ?? '').slice(0, 24) || '—'
+  return `#${index + 1} ${preview}`
+}
+function fieldLabel(field: string): string {
+  if (field === DELETE_FIELD) return store.t('fieldDelete')
+  if (field === 'termIds') return store.t('fieldTermIds')
+  return store.t(field as 'source')
+}
+function fieldValue(cue: Cue | undefined, field: string): string {
+  if (!cue) return store.t('deletedValue')
+  if (field === DELETE_FIELD) return store.t('deletedValue')
+  if (field === 'actorId') return actorName(cue.actorId)
+  if (field === 'termIds') {
+    const names = cue.termIds
+      .map((id) => project.value.terms.find((term) => term.id === id)?.source ?? id)
+      .join('、')
+    return names || '—'
+  }
+  if (field === 'status') return statusLabel(cue.status)
+  if (field === 'locked') return cue.locked ? store.t('locked') : store.t('unlock')
+  return String((cue as unknown as Record<string, unknown>)[field] ?? '—')
+}
 
 function updateSelected(patch: Partial<Cue>, label = 'update-cue') {
   if (selectedCue.value) store.updateCue(selectedCue.value.id, patch, label)
@@ -158,8 +192,8 @@ const handleOffline = () => setOnline(false)
         <span>{{ store.t('conflictBody') }}</span>
       </div>
       <div class="conflict-actions">
-        <el-button size="small" @click="store.loadLatest">{{ store.t('loadLatest') }}</el-button>
-        <el-button size="small" type="danger" @click="store.keepMine">{{ store.t('keepMine') }}</el-button>
+        <el-button size="small" type="primary" @click="conflictDialog = true">{{ store.t('viewConflicts') }} ({{ cueConflicts.length }})</el-button>
+        <el-button size="small" @click="store.loadLatest">{{ store.t('loadLatestAnyway') }}</el-button>
       </div>
     </div>
 
@@ -328,6 +362,35 @@ const handleOffline = () => setOnline(false)
         <p v-if="!project.snapshots.length" class="empty-state">{{ store.t('noSnapshots') }}</p>
       </div>
       <template #footer><el-button type="primary" @click="createSnapshot">{{ store.t('snapshot') }}</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="conflictDialog" :title="store.t('conflictPanelTitle')" width="760px">
+      <p class="conflict-panel-hint">{{ store.t('conflictPanelBody') }}</p>
+      <div v-for="item in cueConflicts" :key="item.cueId" class="conflict-cue">
+        <div class="conflict-cue-head">
+          <strong>{{ store.t('conflictCue') }} {{ cueDisplay(item.local ?? item.remote ?? item.base, item.cueId) }}</strong>
+        </div>
+        <div v-for="field in item.fields" :key="field" class="conflict-field">
+          <div class="conflict-field-name">{{ fieldLabel(field) }}</div>
+          <div class="conflict-field-values">
+            <div class="conflict-value mine">
+              <span class="conflict-side">{{ store.t('keepMineCue') }}</span>
+              <pre>{{ fieldValue(item.local, field) }}</pre>
+            </div>
+            <div class="conflict-value theirs">
+              <span class="conflict-side">{{ store.t('takeTheirsCue') }}</span>
+              <pre>{{ fieldValue(item.remote, field) }}</pre>
+            </div>
+          </div>
+        </div>
+        <div class="conflict-cue-actions">
+          <el-button size="small" type="primary" :loading="store.saving" @click="store.resolveCue(item.cueId, 'mine')">{{ store.t('keepMineCue') }}</el-button>
+          <el-button size="small" @click="store.resolveCue(item.cueId, 'theirs')">{{ store.t('takeTheirsCue') }}</el-button>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="store.loadLatest">{{ store.t('loadLatestAnyway') }}</el-button>
+      </template>
     </el-dialog>
   </div>
 </template>

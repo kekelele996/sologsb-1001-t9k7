@@ -26,35 +26,24 @@ const transact = async <T>(mode: IDBTransactionMode, action: (store: IDBObjectSt
 
 export const loadDocument = (id: string) => transact<EditorDocument | undefined>('readonly', (store) => store.get(id))
 
-export const saveDocument = async (document: EditorDocument, expectedRevision?: number) => {
+/** Unconditional write: stores the document as the next revision without an optimistic lock. */
+export const putDocument = async (document: EditorDocument): Promise<EditorDocument> => {
   const db = await openDb()
   return new Promise<EditorDocument>((resolve, reject) => {
     const tx = db.transaction(STORE, 'readwrite')
     const store = tx.objectStore(STORE)
-    const getRequest = store.get(document.id)
-    let next: EditorDocument | undefined
-    let settled = false
-    getRequest.onsuccess = () => {
-      const current = getRequest.result as EditorDocument | undefined
-      if (expectedRevision !== undefined && current && current.revision !== expectedRevision) {
-        settled = true
-        reject(new Error('REVISION_CONFLICT'))
-        return
-      }
-      next = { ...document, revision: (current?.revision ?? document.revision ?? 0) + 1, updatedAt: Date.now() }
-      store.put(next)
-    }
+    store.put(document)
     tx.oncomplete = () => {
       db.close()
-      if (!settled && next) resolve(next)
+      resolve(document)
     }
     tx.onerror = () => {
       db.close()
-      if (!settled) reject(tx.error)
+      reject(tx.error)
     }
     tx.onabort = () => {
       db.close()
-      if (!settled) reject(tx.error ?? new Error('TRANSACTION_ABORTED'))
+      reject(tx.error ?? new Error('TRANSACTION_ABORTED'))
     }
   })
 }

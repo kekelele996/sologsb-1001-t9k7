@@ -114,6 +114,18 @@ kbd { padding: 2px 5px; border: 1px solid #5a6981; border-radius: 4px; color: wh
 .snapshot-item { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #edf0f4; }
 .snapshot-item div { display: flex; flex-direction: column; gap: 3px; }
 .snapshot-item small, .snapshot-item span { color: #7b8799; font-size: 11px; }
+.conflict-panel-hint { margin: 0 0 14px; color: #7c8799; font-size: 12px; line-height: 1.6; }
+.conflict-cue { padding: 12px 0; border-top: 1px solid #edf0f4; }
+.conflict-cue-head { margin-bottom: 8px; color: #233452; font-size: 13px; }
+.conflict-field { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 10px; align-items: start; margin-bottom: 8px; }
+.conflict-field-name { padding-top: 6px; color: #647187; font-size: 11px; font-weight: 700; }
+.conflict-field-values { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.conflict-value { padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: #f8fafc; }
+.conflict-value.mine { border-color: #bcd0f5; background: #f0f5ff; }
+.conflict-value.theirs { border-color: #f0c4c4; background: #fff5f5; }
+.conflict-side { display: block; margin-bottom: 3px; color: #8793a7; font-size: 10px; font-weight: 700; }
+.conflict-value pre { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; color: #33425a; font-size: 12px; font-family: inherit; }
+.conflict-cue-actions { display: flex; gap: 8px; margin-top: 4px; }
 @media (max-width: 1380px) {
   .workspace { grid-template-columns: 224px minmax(580px, 1fr) 330px; }
   .shortcut-bar { left: 224px; right: 330px; }

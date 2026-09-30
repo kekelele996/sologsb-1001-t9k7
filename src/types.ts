@@ -12,6 +12,8 @@ export interface Cue {
   termIds: string[]
   status: CueStatus
   locked: boolean
+  /** Per-cue revision. Increments only when this cue's content changes in a save. Missing on old drafts. */
+  rev?: number
 }
 
 export interface Actor {
@@ -52,6 +54,19 @@ export interface CueConflict {
   cueId: string
   type: 'actor' | 'tone' | 'address'
   message: string
+}
+
+/** A per-cue save conflict: the same cue was changed on both sides at the same field. */
+export interface CueMergeConflict {
+  cueId: string
+  /** Field names that collided; '__delete__' means one side deleted while the other modified. */
+  fields: string[]
+  /** The last synced state both sides started from. */
+  base: Cue
+  /** This tab's version; undefined if this side deleted the cue. */
+  local: Cue | undefined
+  /** The version already stored by the other tab; undefined if that side deleted the cue. */
+  remote: Cue | undefined
 }
 
 export interface HistoryEntry {
