@@ -133,3 +133,21 @@ kbd { padding: 2px 5px; border: 1px solid #5a6981; border-radius: 4px; color: wh
   .cue-row { grid-template-columns: 34px minmax(0, 1fr); }
   .cue-quick-actions { grid-column: 2; }
 }
+
+/* 逐台词合并冲突面板 */
+.merge-body { margin: 0 0 14px; font-size: 13px; color: #5b6577; }
+.merge-item { border: 1px solid #e6e9f0; border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; background: #fafbfe; }
+.merge-item-head { display: flex; align-items: center; gap: 10px; cursor: pointer; margin-bottom: 10px; }
+.merge-item-head strong { color: #2f3a55; }
+.merge-summary { flex: 1; color: #5b6577; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.field-row { display: grid; grid-template-columns: 88px 1fr 1fr; gap: 10px; align-items: stretch; margin-bottom: 8px; }
+.field-name { font-size: 12px; color: #8893a8; align-self: center; }
+.side-card { border: 1px solid #dfe4ee; border-radius: 8px; padding: 8px 10px; cursor: pointer; background: #fff; transition: border-color .15s, box-shadow .15s; }
+.side-card small { display: block; font-size: 11px; color: #8893a8; margin-bottom: 4px; }
+.side-card p { margin: 0; font-size: 13px; color: #2f3a55; white-space: pre-wrap; word-break: break-word; }
+.side-card.chosen { border-color: #2f6fed; box-shadow: 0 0 0 2px rgba(47, 111, 237, .15); }
+.side-card.remote.chosen { border-color: #14866d; box-shadow: 0 0 0 2px rgba(20, 134, 109, .15); }
+.delete-choice { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+.delete-note { display: flex; gap: 6px; }
+.merge-item-actions { display: flex; justify-content: flex-end; margin-top: 6px; }
+.merge-dialog .el-dialog__body { max-height: 64vh; overflow-y: auto; }

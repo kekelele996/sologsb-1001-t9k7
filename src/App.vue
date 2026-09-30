@@ -7,11 +7,12 @@ import {
   RefreshLeft, RefreshRight, Search, Unlock, UploadFilled,
 } from '@element-plus/icons-vue'
 import { useEditorStore } from './store/editor'
-import type { Cue, CueConflict } from './types'
+import type { Cue, CueConflict, CueField, CueMergeConflict, FieldConflict } from './types'
+import type { MessageKey } from './i18n'
 import { formatTime } from './utils/subtitle'
 
 const store = useEditorStore()
-const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, online, timelineZoom, actorFilter } = storeToRefs(store)
+const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, conflictDialog, mergeConflicts, online, timelineZoom, actorFilter } = storeToRefs(store)
 const fileInput = ref<HTMLInputElement>()
 const snapshotDialog = ref(false)
 const snapshotName = ref('')
@@ -110,6 +111,55 @@ function setOnline(value: boolean) {
   store.setOnline(value)
   ElMessage({ message: store.t(value ? 'online' : 'offline'), type: value ? 'success' : 'warning' })
 }
+
+const FIELD_LABEL_KEY: Record<CueField, MessageKey> = {
+  start: 'fieldStart', end: 'fieldEnd', source: 'fieldSource', target: 'fieldTarget', actorId: 'fieldActorId',
+  speed: 'fieldSpeed', termIds: 'fieldTermIds', status: 'fieldStatus', locked: 'fieldLocked',
+}
+function fieldLabel(field: CueField) {
+  return store.t(FIELD_LABEL_KEY[field])
+}
+function fieldValueText(cue: Cue | undefined, field: CueField): string {
+  if (!cue) return '—'
+  const value = cue[field]
+  if (field === 'actorId') return actorName(cue.actorId)
+  if (field === 'start' || field === 'end') return formatTime(Number(value))
+  if (field === 'termIds') return (value as string[]).map((id) => project.value.terms.find((term) => term.id === id)?.target ?? id).join('、') || '—'
+  if (field === 'locked') return value ? '🔒' : '—'
+  return String(value ?? '—') || '—'
+}
+function conflictSummary(item: CueMergeConflict) {
+  const cue = item.remote ?? item.local
+  return cue ? `${formatTime(cue.start)} · ${(cue.target || cue.source || '').slice(0, 40)}` : item.cueId
+}
+function chooseField(item: CueMergeConflict, fieldConflict: FieldConflict, side: 'local' | 'remote') {
+  store.setConflictResolution(item.cueId, fieldConflict.field, side)
+}
+async function saveOne(item: CueMergeConflict) {
+  await store.retryConflicts([item.cueId])
+  const still = store.mergeConflicts.some((conflictItem) => conflictItem.cueId === item.cueId)
+  ElMessage[still ? 'warning' : 'success'](store.t(still ? 'retryStillConflict' : 'retrySucceeded'))
+}
+async function saveAllResolved() {
+  try {
+    await store.retryConflicts()
+    ElMessage[store.mergeConflicts.length ? 'warning' : 'success'](
+      store.t(store.mergeConflicts.length ? 'retryStillConflict' : 'retrySucceeded'),
+    )
+  } catch {
+    ElMessage.error(store.t('retryFailed'))
+  }
+}
+async function discardLocalConflicts() {
+  await store.takeRemoteConflicts()
+}
+function locateCue(item: CueMergeConflict) {
+  store.selectCue(item.cueId)
+}
+const autoMergedCount = computed(() => {
+  // 触发本次冲突的保存中，除冲突条目外的台词都已落库；用本页台词总数给出提示
+  return Math.max(0, project.value.cues.length - mergeConflicts.value.length)
+})
 onMounted(async () => {
   await store.initialize()
   window.addEventListener('keydown', onKeydown)
@@ -154,12 +204,12 @@ const handleOffline = () => setOnline(false)
 
     <div v-if="conflict" class="conflict-banner">
       <div>
-        <strong>{{ store.t('conflictTitle') }}</strong>
-        <span>{{ store.t('conflictBody') }}</span>
+        <strong>{{ store.t('mergeConflictTitle', { count: mergeConflicts.length }) }}</strong>
+        <span>{{ store.t('mergeSaved', { count: autoMergedCount }) }}</span>
       </div>
       <div class="conflict-actions">
-        <el-button size="small" @click="store.loadLatest">{{ store.t('loadLatest') }}</el-button>
-        <el-button size="small" type="danger" @click="store.keepMine">{{ store.t('keepMine') }}</el-button>
+        <el-button size="small" @click="store.conflictDialog = true">{{ store.t('mergeConflictTitle', { count: mergeConflicts.length }) }}</el-button>
+        <el-button size="small" @click="discardLocalConflicts">{{ store.t('takeRemote') }}</el-button>
       </div>
     </div>
 
@@ -245,6 +295,9 @@ const handleOffline = () => setOnline(false)
                 <code>{{ formatTime(cue.start) }} → {{ formatTime(cue.end) }}</code>
                 <el-tag size="small" :type="statusType(cue.status)">{{ statusLabel(cue.status) }}</el-tag>
                 <el-icon v-if="cue.locked"><Lock /></el-icon>
+                <el-tag v-if="mergeConflicts.some((item) => item.cueId === cue.id)" size="small" type="warning" effect="dark" @click.stop="store.conflictDialog = true">
+                  {{ store.t('conflictBadge') }}
+                </el-tag>
                 <span class="cue-warning-count" v-if="cueWarnings(cue).length">{{ cueWarnings(cue).length }} context</span>
               </div>
               <p class="source-text">{{ cue.source }}</p>
@@ -328,6 +381,78 @@ const handleOffline = () => setOnline(false)
         <p v-if="!project.snapshots.length" class="empty-state">{{ store.t('noSnapshots') }}</p>
       </div>
       <template #footer><el-button type="primary" @click="createSnapshot">{{ store.t('snapshot') }}</el-button></template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="store.conflictDialog" :title="store.t('mergeConflictTitle', { count: mergeConflicts.length })"
+      width="760px" top="6vh" class="merge-dialog"
+    >
+      <p class="merge-body">{{ store.t('mergeConflictBody') }}</p>
+      <div v-for="item in mergeConflicts" :key="item.cueId" class="merge-item">
+        <div class="merge-item-head" @click="locateCue(item)">
+          <el-tag size="small" type="warning">{{ store.t('conflictBadge') }}</el-tag>
+          <strong>#{{ project.cues.findIndex((cue) => cue.id === item.cueId) + 1 || item.index + 1 }}</strong>
+          <span class="merge-summary">{{ conflictSummary(item) }}</span>
+          <el-button size="small" text type="primary" @click.stop="locateCue(item)">{{ store.t('inspector') }}</el-button>
+        </div>
+
+        <template v-if="item.kind === 'delete'">
+          <div class="delete-choice">
+            <el-radio-group
+              :model-value="item.deleteChoice ?? 'keep'"
+              @change="store.setDeleteChoice(item.cueId, $event as 'keep' | 'delete')"
+            >
+              <el-radio value="keep">{{ store.t('keepEdited') }}</el-radio>
+              <el-radio value="delete">{{ store.t('confirmDeleteCue') }}</el-radio>
+            </el-radio-group>
+            <div class="delete-note">
+              <el-tag v-if="!item.local" size="small" type="info">{{ store.t('localDeleted') }}</el-tag>
+              <el-tag v-if="!item.remote" size="small" type="info">{{ store.t('remoteDeleted') }}</el-tag>
+            </div>
+          </div>
+          <!-- 删除 vs 修改：一方已整条删除，无字段可挑，只展示幸存方修改后的内容 -->
+          <div v-for="fieldConflict in item.fields" :key="fieldConflict.field" class="field-row">
+            <span class="field-name">{{ fieldLabel(fieldConflict.field) }}</span>
+            <div class="side-card" :class="{ chosen: !!item.local }">
+              <small>{{ item.local ? store.t('localSide') : store.t('localDeleted') }}</small>
+              <p>{{ fieldValueText(item.local, fieldConflict.field) }}</p>
+            </div>
+            <div class="side-card remote" :class="{ chosen: !!item.remote }">
+              <small>{{ item.remote ? store.t('remoteSide') : store.t('remoteDeleted') }}</small>
+              <p>{{ fieldValueText(item.remote, fieldConflict.field) }}</p>
+            </div>
+          </div>
+        </template>
+
+        <template v-else>
+          <div v-for="fieldConflict in item.fields" :key="fieldConflict.field" class="field-row">
+            <span class="field-name">{{ fieldLabel(fieldConflict.field) }}</span>
+            <div
+              class="side-card" :class="{ chosen: fieldConflict.resolution === 'local' }"
+              @click="chooseField(item, fieldConflict, 'local')"
+            >
+              <small>{{ store.t('localSide') }}</small>
+              <p>{{ fieldValueText(item.local, fieldConflict.field) }}</p>
+            </div>
+            <div
+              class="side-card remote" :class="{ chosen: fieldConflict.resolution === 'remote' }"
+              @click="chooseField(item, fieldConflict, 'remote')"
+            >
+              <small>{{ store.t('remoteSide') }}</small>
+              <p>{{ fieldValueText(item.remote, fieldConflict.field) }}</p>
+            </div>
+          </div>
+        </template>
+
+        <div class="merge-item-actions">
+          <el-button size="small" type="primary" :loading="store.saving" @click="saveOne(item)">{{ store.t('saveThisCue') }}</el-button>
+        </div>
+      </div>
+      <p v-if="!mergeConflicts.length" class="empty-state">{{ store.t('empty') }}</p>
+      <template #footer>
+        <el-button @click="discardLocalConflicts">{{ store.t('takeRemote') }}</el-button>
+        <el-button type="primary" :loading="store.saving" @click="saveAllResolved">{{ store.t('saveAllResolved') }}</el-button>
+      </template>
     </el-dialog>
   </div>
 </template>

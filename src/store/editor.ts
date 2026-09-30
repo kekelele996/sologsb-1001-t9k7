@@ -1,16 +1,31 @@
 import { defineStore } from 'pinia'
-import type { Cue, EditorDocument, Locale, Snapshot } from '../types'
-import { loadDocument, saveDocument } from '../utils/db'
+import type { Cue, CueMergeConflict, EditorDocument, Locale, Snapshot } from '../types'
+import { loadDocument, saveDocument, loadPendingMerge, savePendingMerge, deletePendingMerge } from '../utils/db'
 import { makeId } from '../utils/id'
 import { parseScript, parseSrt, toSrt } from '../utils/subtitle'
+import { mergeDocuments, resolveCueConflict } from '../utils/merge'
 import { translate, type MessageKey } from '../i18n'
 
 const DOCUMENT_ID = 'subtitle-dubbing-document'
 let saveTimer: ReturnType<typeof setTimeout> | undefined
 let channel: BroadcastChannel | undefined
+/** 当前进行中的保存 Promise（测试/调试时可 await 自动保存真正落库） */
+let inflight: Promise<void> | undefined
+export const pendingSave = () => inflight ?? Promise.resolve()
 
 const cloneCues = (cues: Cue[]): Cue[] => JSON.parse(JSON.stringify(cues)) as Cue[]
 const plainDocument = (document: EditorDocument): EditorDocument => JSON.parse(JSON.stringify(document)) as EditorDocument
+
+/** 旧稿（没有分条记录）补全 cueRev，升级后仍可作为逐台词合并的基点 */
+const ensureCueRevisions = (document: EditorDocument): EditorDocument => {
+  let touched = false
+  const cues = document.cues.map((cue) => {
+    if (typeof cue.cueRev === 'number') return cue
+    touched = true
+    return { ...cue, cueRev: document.revision }
+  })
+  return touched ? { ...document, cues } : document
+}
 
 const createDefaultDocument = (): EditorDocument => ({
   id: DOCUMENT_ID,
@@ -54,10 +69,16 @@ export const useEditorStore = defineStore('subtitle-editor', {
     saving: false,
     initialized: false,
     conflict: false,
+    conflictDialog: false,
+    mergeConflicts: [] as CueMergeConflict[],
     online: navigator.onLine,
     tabId: makeId('tab'),
     lastSeenRevision: 0,
     mutationSerial: 0,
+    /** 本页已确认的文档版本，作为逐台词三方合并的基点 */
+    baseDocument: null as EditorDocument | null,
+    /** 已收到其它标签页的更新通知、等待下次保存时合并 */
+    remoteAhead: false,
     past: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
     future: [] as { label: string; cues: Cue[]; selectedCueId: string | null }[],
   }),
@@ -81,13 +102,31 @@ export const useEditorStore = defineStore('subtitle-editor', {
       this.online = navigator.onLine
       const stored = await loadDocument(DOCUMENT_ID)
       if (stored) {
-        this.document = stored
-        this.lastSeenRevision = stored.revision
+        // 旧稿没有分条修订记录：读出来时补全，之后即可参与逐台词合并
+        const migrated = ensureCueRevisions(stored)
+        if (migrated !== stored) {
+          const next = await saveDocument(migrated, stored.revision)
+          this.document = next
+          this.lastSeenRevision = next.revision
+        } else {
+          this.document = migrated
+          this.lastSeenRevision = migrated.revision
+        }
       } else {
-        const saved = await saveDocument(plainDocument(this.document))
+        const initial = ensureCueRevisions(plainDocument(this.document))
+        const saved = await saveDocument(initial)
         this.document = saved
         this.lastSeenRevision = saved.revision
       }
+      // 刷新后仍有未解决的冲突：恢复冲突面板，已写入的台词不退回
+      const pending = await loadPendingMerge(DOCUMENT_ID)
+      if (pending?.conflicts.length) {
+        this.mergeConflicts = pending.conflicts
+        this.conflict = true
+        this.conflictDialog = true
+        this.saveState = 'conflict'
+      }
+      this.baseDocument = plainDocument(this.document)
       this.initialized = true
       if ('BroadcastChannel' in window) {
         channel = new BroadcastChannel('sologsb-1001-document')
@@ -95,16 +134,17 @@ export const useEditorStore = defineStore('subtitle-editor', {
           const message = event.data as { type: string; tabId: string; revision: number; documentId: string }
           if (message.type !== 'document-updated' || message.tabId === this.tabId || message.documentId !== DOCUMENT_ID) return
           if (message.revision <= this.lastSeenRevision) return
-          if (this.saveState === 'dirty' || this.saveState === 'saving' || this.conflict) {
-            this.conflict = true
-            this.saveState = 'conflict'
-            return
-          }
-          const latest = await loadDocument(DOCUMENT_ID)
-          if (latest && latest.revision > this.lastSeenRevision) {
-            this.document = latest
-            this.lastSeenRevision = latest.revision
-            this.saveState = 'saved'
+          // 不整页判冲突：有未保存修改时由下次保存做逐台词合并；无修改时静默更新
+          this.remoteAhead = true
+          if (this.saveState !== 'dirty' && this.saveState !== 'saving' && !this.conflict) {
+            const latest = await loadDocument(DOCUMENT_ID)
+            if (latest && latest.revision > this.lastSeenRevision) {
+              this.document = ensureCueRevisions(latest)
+              this.lastSeenRevision = latest.revision
+              this.baseDocument = plainDocument(latest)
+              this.remoteAhead = false
+              this.saveState = 'saved'
+            }
           }
         }
       }
@@ -140,58 +180,197 @@ export const useEditorStore = defineStore('subtitle-editor', {
       }
     },
     async persist(label = 'autosave') {
-      if (!this.initialized || this.conflict || this.saveState === 'saving') return
+      if (!this.initialized || this.saveState === 'saving') return
+      const run = this.runPersist(label)
+      inflight = run
+      try {
+        await run
+      } finally {
+        if (inflight === run) inflight = undefined
+      }
+    },
+    async runPersist(label: string) {
       const serial = this.mutationSerial
       this.saveState = 'saving'
       this.saving = true
       try {
-        const next = await saveDocument({ ...plainDocument(this.document), lastWriter: this.tabId }, this.lastSeenRevision)
-        this.document.revision = next.revision
-        this.document.updatedAt = next.updatedAt
-        this.lastSeenRevision = next.revision
-        if (serial === this.mutationSerial) {
-          this.saveState = 'saved'
-        } else {
-          this.saveState = 'dirty'
+        // 未挑选的冲突条目维持对方内容，不会被本次保存静默提交；
+        // 只保存用户另外修改的台词，冲突清单继续保留。
+        const draft = this.buildLocalDraft()
+        const result = await this.syncToRemote(draft)
+        if (result) {
+          this.document = ensureCueRevisions(result.document)
+          const newIds = new Set(result.conflicts.map((item) => item.cueId))
+          const preserved = this.conflict
+            ? this.mergeConflicts.filter((item) => !newIds.has(item.cueId))
+            : []
+          this.applySyncResult({ document: result.document, conflicts: [...result.conflicts, ...preserved] }, serial)
         }
-        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_ID })
       } catch (error) {
-        if (error instanceof Error && error.message === 'REVISION_CONFLICT') {
-          this.conflict = true
-          this.saveState = 'conflict'
-        } else {
-          this.saveState = 'dirty'
-          console.error(label, error)
-        }
+        this.saveState = 'dirty'
+        console.error(label, error)
       } finally {
         this.saving = false
         if (this.saveState === 'dirty') {
           if (saveTimer) clearTimeout(saveTimer)
-          saveTimer = setTimeout(() => void this.persist(label), 700)
+          saveTimer = setTimeout(() => void this.persist(label), 1200)
         }
       }
     },
-    async keepMine() {
+    /**
+     * 保存的核心：乐观锁提交；若对方先保存，则读最新版做逐台词三方合并后重试。
+     * 不同台词的修改各自写入，只有同一条同一处两边都改了才产生冲突。
+     * 冲突不阻断其它台词的写入——合并结果（冲突字段暂取远端值）整体落库，
+     * 冲突清单单独保存，用户挑完后只重试冲突条目。
+     */
+    async syncToRemote(localDraft: EditorDocument): Promise<{ document: EditorDocument; conflicts: CueMergeConflict[] } | null> {
+      const attempt = async (doc: EditorDocument, expected: number) => {
+        // 本次写入成功后，每条分条记录推进到新版本；JSON 拷贝确保不含 Vue 代理（IndexedDB 要求可结构化克隆）
+        const clean = JSON.parse(JSON.stringify(doc)) as EditorDocument
+        const stamped: EditorDocument = {
+          ...clean,
+          cues: clean.cues.map((cue) => ({ ...cue, cueRev: expected + 1 })),
+        }
+        return saveDocument({ ...stamped, lastWriter: this.tabId }, expected)
+      }
       try {
-        this.saving = true
-        const latest = await loadDocument(DOCUMENT_ID)
-        const expected = latest?.revision ?? this.lastSeenRevision
-        const next = await saveDocument({ ...plainDocument(this.document), lastWriter: this.tabId }, expected)
-        this.document.revision = next.revision
-        this.lastSeenRevision = next.revision
+        const next = await attempt(localDraft, this.lastSeenRevision)
+        this.baseDocument = plainDocument(next)
+        return { document: next, conflicts: [] }
+      } catch (error) {
+        if (!(error instanceof Error && error.message === 'REVISION_CONFLICT')) throw error
+      }
+      // 对方先写：逐台词合并（最多重试两轮，避免极端并发下死循环）
+      for (let round = 0; round < 2; round += 1) {
+        const remote = await loadDocument(DOCUMENT_ID)
+        if (!remote) throw new Error('DOCUMENT_MISSING')
+        const base = (this.baseDocument ?? this.document) as EditorDocument
+        const merged = mergeDocuments(localDraft, ensureCueRevisions(remote), base, remote.revision + 1)
+        try {
+          const saved = await attempt(merged.document, remote.revision)
+          this.baseDocument = plainDocument(saved)
+          return { document: saved, conflicts: merged.conflicts }
+        } catch (error) {
+          if (!(error instanceof Error && error.message === 'REVISION_CONFLICT')) throw error
+          // 又有人写入：以刚读到的远端为新基点再合并一次
+          this.baseDocument = plainDocument(remote)
+        }
+      }
+      // 持续并发：退回待保存，稍后由定时器重试，已落库的内容不受影响
+      throw new Error('REVISION_CONFLICT')
+    },
+    /** 把本页视图与待解决冲突清单应用一次同步结果 */
+    applySyncResult(result: { document: EditorDocument; conflicts: CueMergeConflict[] }, serial?: number) {
+      const fresh = serial === undefined || serial === this.mutationSerial
+      const wasConflict = this.conflict
+      if (result.conflicts.length) {
+        this.mergeConflicts = result.conflicts
+        this.conflict = true
+        this.saveState = 'conflict'
+        // 仅在首次发现冲突时自动弹出面板；用户关掉后不再被自动保存打断
+        this.conflictDialog = this.conflictDialog || !wasConflict
+        void savePendingMerge({ id: DOCUMENT_ID, baseRevision: this.lastSeenRevision, conflicts: result.conflicts, updatedAt: Date.now() })
+      } else {
+        this.mergeConflicts = []
         this.conflict = false
-        this.saveState = 'saved'
-        channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: next.revision, documentId: DOCUMENT_ID })
+        this.conflictDialog = false
+        void deletePendingMerge(DOCUMENT_ID)
+        this.saveState = fresh ? 'saved' : 'dirty'
+      }
+      this.lastSeenRevision = result.document.revision
+      this.remoteAhead = false
+      channel?.postMessage({ type: 'document-updated', tabId: this.tabId, revision: result.document.revision, documentId: DOCUMENT_ID })
+    },
+    /**
+     * 用冲突记录里的本页内容（含用户选择）叠加出待保存草稿。
+     * retryCueIds 给出本次要重试保存的冲突条目；不传则一条都不叠加，
+     * 保证普通自动保存不会替用户对未挑选的冲突做决定。
+     */
+    buildLocalDraft(retryCueIds?: Set<string>): EditorDocument {
+      const relevant = retryCueIds
+        ? this.mergeConflicts.filter((item) => retryCueIds.has(item.cueId))
+        : []
+      if (!relevant.length) return ensureCueRevisions(plainDocument(this.document))
+      const draft = ensureCueRevisions(plainDocument(this.document))
+      const byId = new Map(draft.cues.map((cue) => [cue.id, cue]))
+      for (const conflict of relevant) {
+        const resolved = resolveCueConflict(conflict)
+        const current = byId.get(conflict.cueId)
+        if (resolved === null) {
+          if (current) draft.cues.splice(draft.cues.indexOf(current), 1)
+        } else if (current) {
+          Object.assign(current, resolved)
+        } else {
+          // 删除 vs 修改冲突中本页已删掉该条：按基点位置插回
+          const insertAt = Math.min(conflict.index, draft.cues.length)
+          draft.cues.splice(insertAt, 0, resolved)
+          byId.set(resolved.id, resolved)
+        }
+      }
+      return draft
+    },
+    /** 冲突字段选择：两边内容逐条挑 */
+    setConflictResolution(cueId: string, field: CueMergeConflict['fields'][number]['field'], side: 'local' | 'remote') {
+      const conflict = this.mergeConflicts.find((item) => item.cueId === cueId)
+      const fieldConflict = conflict?.fields.find((item) => item.field === field)
+      if (fieldConflict) fieldConflict.resolution = side
+    },
+    setDeleteChoice(cueId: string, choice: 'keep' | 'delete') {
+      const conflict = this.mergeConflicts.find((item) => item.cueId === cueId)
+      if (conflict && conflict.kind === 'delete') conflict.deleteChoice = choice
+    },
+    /**
+     * 冲突条目保存失败后单独重试：只把这一条（或一批）的选择重新合并。
+     * 重试再失败，也不退回已经写入的其它台词——它们已经在库里。
+     */
+    async retryConflicts(cueIds?: string[]) {
+      if (!this.mergeConflicts.length || this.saving) return
+      const targets = cueIds ? new Set(cueIds) : new Set(this.mergeConflicts.map((item) => item.cueId))
+      const draft = this.buildLocalDraft(targets)
+      this.saving = true
+      const serial = this.mutationSerial
+      try {
+        const result = await this.syncToRemote(draft)
+        if (!result) return
+        // 合并以整份文档为单位；仍未解决（远端又改了同一处）的条目继续保留
+        const remaining = result.conflicts.filter((item) => targets.has(item.cueId))
+        const untouched = this.mergeConflicts.filter((item) => !targets.has(item.cueId))
+        const allRemaining = [...untouched, ...remaining]
+        this.document = ensureCueRevisions(result.document)
+        const hadDialog = this.conflictDialog
+        this.applySyncResult({ document: result.document, conflicts: allRemaining }, serial)
+        this.conflictDialog = allRemaining.length > 0 ? hadDialog : false
+      } catch (error) {
+        // 重试再失败：已写入的台词不回滚，只保留这些冲突条目稍后再试
+        console.error('retry-conflict', error)
       } finally {
         this.saving = false
+      }
+    },
+    /** 放弃本页对冲突条目的修改，直接采用对方保存的版本（不清动其它已写入台词） */
+    async takeRemoteConflicts(cueIds?: string[]) {
+      const targets = cueIds ? new Set(cueIds) : new Set(this.mergeConflicts.map((item) => item.cueId))
+      const remaining = this.mergeConflicts.filter((item) => !targets.has(item.cueId))
+      this.mergeConflicts = remaining
+      this.conflict = remaining.length > 0
+      this.saveState = remaining.length ? 'conflict' : 'saved'
+      this.conflictDialog = remaining.length > 0
+      if (remaining.length) {
+        await savePendingMerge({ id: DOCUMENT_ID, baseRevision: this.lastSeenRevision, conflicts: remaining, updatedAt: Date.now() })
+      } else {
+        await deletePendingMerge(DOCUMENT_ID)
       }
     },
     async loadLatest() {
       const latest = await loadDocument(DOCUMENT_ID)
       if (!latest) return
-      this.document = latest
+      this.document = ensureCueRevisions(latest)
+      this.baseDocument = plainDocument(latest)
       this.lastSeenRevision = latest.revision
+      this.mergeConflicts = []
       this.conflict = false
+      this.conflictDialog = false
+      await deletePendingMerge(DOCUMENT_ID)
       this.saveState = 'saved'
       this.selectedCueId = latest.cues[0]?.id ?? null
     },
